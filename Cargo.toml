@@ -1,0 +1,21 @@
+[package]
+name = "precod-compdag"
+version = "0.1.0"
+authors = ["Jan Cristina <jan.cristina@starmind.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+thiserror = "1.0.25"
+GSL = "4.0.0"
+# GPGPU crate – could be useful
+# emu="0.1.1" 
+crossbeam = "0.8.1"
+rand = "0.8.3"
+either = "1.6.1"
+num-traits = "0.2.14"
+nalgebra = {version = "0.27.1", features = ["rand"]}
+impl_ops = "0.1.1"
+rand_distr = "0.4.0"
+left-right = "0.11.4"
