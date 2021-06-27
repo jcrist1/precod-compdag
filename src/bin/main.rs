@@ -1,13 +1,13 @@
 extern crate precod_compdag;
 use precod_compdag::mat_mul;
-use precod_compdag::BranchNode;
 use precod_compdag::DataWrapper;
 use precod_compdag::DiffComp;
 use precod_compdag::ExpAvgPreCod;
 use precod_compdag::InputWithErrorBackProp;
 use precod_compdag::LeafNode;
 use precod_compdag::OutputWithErrorBackProp;
-use precod_compdag::RootNode;
+use precod_compdag::PreCodDagNode;
+use precod_compdag::PreCodDagComms;
 use rand;
 use rand::prelude::*;
 use rand_distr::Uniform;
@@ -32,9 +32,9 @@ const HIDDEN_LAYERS: usize = 128;
 const EMPTY_VEC: Vec<usize> = Vec::<usize>::new();
 const GRADIENT_CUTOFF: f64 = 1.0;
 const TOL: f64 = 1.0e-7;
-const ERR_LEARNING_RATE: f64 = 0.05;
-const WEIGHT_LEARNING_RATE: f64 = 0.01;
-const PREDICTION_LEARNING_THRESHOLD: f64 = 0.01;
+const ERR_LEARNING_RATE: f64 = 0.2;
+const WEIGHT_LEARNING_RATE: f64 = 0.2;
+const PREDICTION_LEARNING_THRESHOLD: f64 = 0.2;
 #[derive(Error, Debug)]
 enum Error {
     #[error("No error at index")]
@@ -46,10 +46,23 @@ struct MNISTImage(mat_mul::Matrix<u8, IMAGE_DIM, IMAGE_DIM>);
 #[derive(Debug, Clone)]
 struct MNISTVector(mat_mul::Vector<f64, VEC_DIM>);
 
+// todo: make this derivable as a macro?
+impl DataWrapper<mat_mul::Vector<f64, VEC_DIM>> for MNISTVector {
+    fn from_data(data: &mat_mul::Vector<f64, VEC_DIM>) -> Self {
+        MNISTVector(data.clone())
+    }
+    fn data(&self) -> &mat_mul::Vector<f64, VEC_DIM> {
+        let MNISTVector(data) = self;
+        data
+    }
+    fn data_mut(&mut self) -> &mut mat_mul::Vector<f64, VEC_DIM> {
+        let MNISTVector(data) = self;
+        data
+    }
+}
+
 #[derive(Debug, Clone)]
 struct MNISTClass(mat_mul::Vector<bool, MNIST_CLASSES>);
-#[derive(Debug)]
-struct MNISTClassSmoother(mat_mul::Vector<f64, MNIST_CLASSES>);
 
 #[derive(Debug)]
 struct Hidden(mat_mul::Vector<f64, HIDDEN_LAYERS>);
@@ -67,6 +80,9 @@ impl DataWrapper<mat_mul::Vector<f64, HIDDEN_LAYERS>> for Hidden {
         data
     }
 }
+
+#[derive(Debug)]
+struct MNISTClassSmoother(mat_mul::Vector<f64, MNIST_CLASSES>);
 
 impl DataWrapper<mat_mul::Vector<f64, MNIST_CLASSES>> for MNISTClassSmoother {
     fn from_data(data: &mat_mul::Vector<f64, MNIST_CLASSES>) -> Self {
@@ -155,7 +171,7 @@ fn main() {
             let matrix_data: mat_mul::Matrix<u8, IMAGE_DIM, IMAGE_DIM> =
                 mat_mul::Matrix::from_iter(image_data.iter().map(|x| *x));
 
-            MNISTImage(matrix_data)
+            MNISTImage(matrix_data)git push --set-upstream origin refactor-branch-node
         })
         .collect::<Vec<_>>();
     let mut rng = rand::thread_rng();
@@ -416,16 +432,16 @@ fn main() {
     impl ExpAvgPreCod<f64> for HiddenLayerCalculator {
         type InputType = mat_mul::Vector<f64, HIDDEN_LAYERS>;
         type OutputType = mat_mul::Vector<f64, MNIST_CLASSES>;
-        const INPUT_RETENTION: f64 = 0.5;
-        const ACTIVATION_RETENTION: f64 = 0.5;
+        const INPUT_RETENTION: f64 = 0.9;
+        const ACTIVATION_RETENTION: f64 = 0.9;
     }
 
     struct MNISTHiddenLayer(
-        BranchNode<
+        PreCodDagNode<
             f64,
             Hidden,
-            MNISTClassSmoother,
             mat_mul::Vector<f64, HIDDEN_LAYERS>,
+            MNISTClassSmoother,
             mat_mul::Vector<f64, MNIST_CLASSES>,
             HiddenLayerCalculator,
         >,
@@ -442,17 +458,27 @@ fn main() {
             let calculator = HiddenLayerCalculator::new(rng);
             let input_init = Hidden(mat_mul::Vector::<f64, HIDDEN_LAYERS>::new());
             let activation_init = MNISTClassSmoother(mat_mul::Vector::<f64, MNIST_CLASSES>::new());
-            let branch_node = BranchNode::new(
+            let comms = PreCodDagComms::Branch {
                 input_forward,
                 input_error,
                 output_forward,
                 output_error,
+            };
+            let dag_node = PreCodDagNode::<
+                f64,
+                Hidden,
+                mat_mul::Vector<f64, HIDDEN_LAYERS>,
+                MNISTClassSmoother,
+                mat_mul::Vector<f64, MNIST_CLASSES>,
+                HiddenLayerCalculator
+            >::new(
+                comms,
                 input_init,
                 activation_init,
-                calculator,
+                calculator
             );
 
-            MNISTHiddenLayer(branch_node)
+            MNISTHiddenLayer(dag_node)
         }
     }
 
@@ -519,18 +545,18 @@ fn main() {
         });
 
     let mut counter = 0;
-    let first_batch_size = 10000;
-    let epochs = 10;
+    let first_batch_size = 600;
+    let epochs = 600;
     for epoch in (1..(epochs + 1)).rev() {
         let i = (&mut rng).gen_range(0..10);
         let indexes = indexes_by_class.get(i).unwrap();
-        for _ in 0..(first_batch_size / ((epoch as f64).sqrt() as i32)) {
+        for _ in 0..(first_batch_size / epoch) {
             let sample = (&mut rng).gen_range(0..indexes.len());
             let index = *(&indexes).get(sample).unwrap();
             mnist_input_send.send(images[index].to_f32_arr()).unwrap();
             ground_truth_sender.send(labels[index].clone()).unwrap();
             counter += 1;
-            if counter % 1000 == 0 {
+            if counter % 100 == 0 {
                 println!("label: {:?}", labels[index].clone());
             }
             //println!("{}", &images[index]);
@@ -544,7 +570,7 @@ fn main() {
         .take(counter)
         .for_each(|(loss, pred, label)| {
             processed += 1;
-            if processed % 1000 == 0 {
+            if processed % 100 == 0 {
                 println!("processed {:?}. Loss: {:?}", processed, loss);
                 println!("Prediction: {:?}", pred);
                 println!("sum: {:?}", pred.0.iter().map(|x| *x).sum::<f64>());
