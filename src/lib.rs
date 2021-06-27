@@ -140,7 +140,6 @@ pub fn exp_avg<'a, F, SmoothingType>(
 {
     let one = <F as One>::one();
     let new_weight = one - *retention;
-    println!("{:?}", new_weight);
 
     *old *= *retention / new_weight; // todo checked_div?
     *old += new; // Don't want to assign a new matrix by multiplying new_input

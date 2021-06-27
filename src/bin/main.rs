@@ -416,8 +416,8 @@ fn main() {
     impl ExpAvgPreCod<f64> for HiddenLayerCalculator {
         type InputType = mat_mul::Vector<f64, HIDDEN_LAYERS>;
         type OutputType = mat_mul::Vector<f64, MNIST_CLASSES>;
-        const INPUT_RETENTION: f64 = 0.9;
-        const ACTIVATION_RETENTION: f64 = 0.9;
+        const INPUT_RETENTION: f64 = 0.5;
+        const ACTIVATION_RETENTION: f64 = 0.5;
     }
 
     struct MNISTHiddenLayer(
@@ -467,149 +467,6 @@ fn main() {
         );
         hidden_layer_branch_node.run();
     });
-    //
-    //        println!("initialised next weights");
-    //        let hidden_layer_data =
-    //            mat_mul::Matrix::<f64, MNIST_CLASSES, HIDDEN_LAYERS>::from_distribution(
-    //                &mut rng,
-    //                &Uniform::new(0., 1.0 / ((HIDDEN_LAYERS * MNIST_CLASSES) as f64).sqrt()),
-    //            );
-    //
-    //        let hidden_layer_preds: mat_mul::Vector<f64, HIDDEN_LAYERS> =
-    //            mat_mul::Vector::from_distribution(
-    //                &mut rng,
-    //                &Uniform::new(0., 1.0 / (HIDDEN_LAYERS as f64)),
-    //            );
-    //
-    //        // This should be doable with left_right.  Probably need to implemnt two ops
-    //        // ```
-    //        // AddAssignWeights(mat_mul::Matrxic<f64, HIDDEN_LAYERS, MNIST_CLASSES>),
-    //        // AddAssignPredictions(mat_mul::Vector<f64, HIDDEN_LAYERS>)
-    //        // ```
-    //        struct HiddenLayerBackOwned {
-    //            weights: mat_mul::Matrix<f64, MNIST_CLASSES, HIDDEN_LAYERS>,
-    //            predictions: mat_mul::Vector<f64, HIDDEN_LAYERS>,
-    //        }
-    //
-    //        struct HiddenLayerForwardOwned {
-    //            input: mat_mul::Vector<f64, HIDDEN_LAYERS>,
-    //            activation: mat_mul::Vector<f64, MNIST_CLASSES>,
-    //            prediction_errors: mat_mul::Vector<f64, HIDDEN_LAYERS>,
-    //        }
-    //
-    //        let back_prop_data = Arc::new(Mutex::new(HiddenLayerBackOwned {
-    //            weights: hidden_layer_data,
-    //            predictions: hidden_layer_preds,
-    //        }));
-    //
-    //        let read_back_prop_for_forward = Arc::clone(&back_prop_data);
-    //
-    //        let forward_data = Arc::new(Mutex::new(HiddenLayerForwardOwned {
-    //            input: mat_mul::Vector::new(),
-    //            activation: mat_mul::Vector::new(),
-    //            prediction_errors: mat_mul::Vector::new(),
-    //        }));
-    //
-    //        let read_forward_data_for_back_prop = Arc::clone(&forward_data);
-    //
-    //        let BranchNode {
-    //            input_channels,
-    //            output_channels,
-    //        } = mnist_hidden;
-    //
-    //        let OutputWithErrorBackProp {
-    //            forward_data: output_forward,
-    //            reverse_error_prop: output_backward,
-    //        } = output_channels;
-    //
-    //        let InputWithErrorBackProp {
-    //            forward_data: input_forward,
-    //            reverse_error_prop: input_backward,
-    //        } = input_channels;
-    //
-    //        // Error propagation thread
-    //        thread::spawn(move || {
-    //            output_backward.iter().for_each(|error_from_next| {
-    //                let MNISTClassSmoother(data) = error_from_next;
-    //
-    //                let HiddenLayerForwardOwned {
-    //                    input,
-    //                    activation,
-    //                    prediction_errors,
-    //                } = &*read_forward_data_for_back_prop.lock().unwrap();
-    //
-    //                let HiddenLayerBackOwned {
-    //                    weights,
-    //                    predictions,
-    //                } = &mut *back_prop_data.lock().unwrap();
-    //
-    //                let backprop = weights.transpose()
-    //                    * (activation.component_mul(&data)
-    //                        + (&*activation * ((&*activation * &data) * -1.0)));
-    //                // todo impl sub ops
-    //                let delta = &*prediction_errors + (&backprop * (-1.0));
-    //                delta
-    //                    .iter()
-    //                    .zip(prediction_errors.iter())
-    //                    .zip(predictions.iter_mut())
-    //                    .zip(backprop.iter())
-    //                    .zip(weights.row_iter_mut())
-    //                    .for_each(
-    //                        |((((node_delta, prediction_error), prediction), backprop_row), row)| {
-    //                            if node_delta.abs()
-    //                                > PREDICTION_LEARNING_THRESHOLD * prediction_error.abs()
-    //                            {
-    //                                *prediction -= ERR_LEARNING_RATE * node_delta
-    //                            } else {
-    //                                let scale = -1.0
-    //                                    * backprop_row.min(GRADIENT_CUTOFF).max(-GRADIENT_CUTOFF)
-    //                                    * WEIGHT_LEARNING_RATE
-    //                                    * *prediction_error;
-    //                                let boost = &*input * scale;
-    //                                // println!("UPDATING WEIGHTS!");
-    //                                // println!("{:?}, {:?}", row, boost);
-    //                                *row += &boost;
-    //                            }
-    //                        },
-    //                    );
-    //                // This is so bad
-    //            });
-    //        });
-    //
-    //        // forward propagation
-    //        input_forward.iter().for_each(|hidden_input| {
-    //            let HiddenLayerForwardOwned {
-    //                input,
-    //                activation,
-    //                prediction_errors,
-    //            } = &mut *forward_data.lock().unwrap();
-    //
-    //            let HiddenLayerBackOwned {
-    //                weights,
-    //                predictions,
-    //            } = &*read_back_prop_for_forward.lock().unwrap();
-    //            let Hidden(data) = hidden_input;
-    //            *input += &data; // we exponentially average the stored input over time, to smooth out the weight updates
-    //            *input *= 0.5;
-    //            let new_prediction_errors = predictions + (&data * (-1.0));
-    //            *prediction_errors = new_prediction_errors.clone();
-    //            input_backward.send(Hidden(new_prediction_errors)).unwrap();
-    //
-    //            // todo: implement vec * matrix to get transpose mult
-    //            let logits = weights * &data;
-    //            let mut total = 0.0;
-    //            let exps = logits.map(|logit| {
-    //                let exp = logit.exp();
-    //                total += exp;
-    //                exp
-    //            });
-    //            let output_data = exps.map(|x| x / total);
-    //            *activation = output_data.clone();
-    //            output_forward
-    //                .send(MNISTClassSmoother(output_data))
-    //                .expect("Should do something");
-    //        });
-    //    });
 
     let mnist_output_thr =
         thread::spawn(move || {
@@ -663,7 +520,7 @@ fn main() {
 
     let mut counter = 0;
     let first_batch_size = 10000;
-    let epochs = 100;
+    let epochs = 10;
     for epoch in (1..(epochs + 1)).rev() {
         let i = (&mut rng).gen_range(0..10);
         let indexes = indexes_by_class.get(i).unwrap();
