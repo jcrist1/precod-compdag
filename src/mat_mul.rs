@@ -7,6 +7,7 @@ use std::ops::Add;
 use std::ops::AddAssign;
 use std::ops::Mul;
 use std::ops::MulAssign;
+use std::ops::SubAssign;
 use thiserror::Error;
 
 /// This module is for basic matrix math. Thanks to rust operator overloading I can still get semi
@@ -254,6 +255,27 @@ where
 {
     fn add_assign(&mut self, rhs: Vector<F, N>) {
         *self += &rhs
+    }
+}
+
+impl<'a, F, const N: usize> SubAssign<&'a Vector<F, N>> for Vector<F, N>
+where
+    F: SubAssign<F> + Copy,
+{
+    fn sub_assign(&mut self, rhs: &'a Vector<F, N>) {
+        self.data
+            .iter_mut()
+            .zip(rhs.data.iter())
+            .for_each(|(x, y)| *x -= *y)
+    }
+}
+
+impl<F, const N: usize> SubAssign<Vector<F, N>> for Vector<F, N>
+where
+    F: SubAssign<F> + Copy,
+{
+    fn sub_assign(&mut self, rhs: Vector<F, N>) {
+        *self -= &rhs
     }
 }
 

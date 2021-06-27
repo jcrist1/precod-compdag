@@ -1,6 +1,9 @@
 extern crate precod_compdag;
 use precod_compdag::mat_mul;
 use precod_compdag::BranchNode;
+use precod_compdag::DataWrapper;
+use precod_compdag::DiffComp;
+use precod_compdag::ExpAvgPreCod;
 use precod_compdag::InputWithErrorBackProp;
 use precod_compdag::LeafNode;
 use precod_compdag::OutputWithErrorBackProp;
@@ -27,10 +30,11 @@ const VEC_DIM: usize = 784; // IMAGE_DIM * IMAGE_DIM
 const MNIST_CLASSES: usize = 10;
 const HIDDEN_LAYERS: usize = 128;
 const EMPTY_VEC: Vec<usize> = Vec::<usize>::new();
+const GRADIENT_CUTOFF: f64 = 1.0;
 const TOL: f64 = 1.0e-7;
-const ERR_LEARNING_RATE: f64 = 0.4;
-const WEIGHT_LEARNING_RATE: f64 = 0.1;
-
+const ERR_LEARNING_RATE: f64 = 0.05;
+const WEIGHT_LEARNING_RATE: f64 = 0.01;
+const PREDICTION_LEARNING_THRESHOLD: f64 = 0.01;
 #[derive(Error, Debug)]
 enum Error {
     #[error("No error at index")]
@@ -49,6 +53,34 @@ struct MNISTClassSmoother(mat_mul::Vector<f64, MNIST_CLASSES>);
 
 #[derive(Debug)]
 struct Hidden(mat_mul::Vector<f64, HIDDEN_LAYERS>);
+
+impl DataWrapper<mat_mul::Vector<f64, HIDDEN_LAYERS>> for Hidden {
+    fn from_data(data: &mat_mul::Vector<f64, HIDDEN_LAYERS>) -> Self {
+        Hidden(data.clone())
+    }
+    fn data(&self) -> &mat_mul::Vector<f64, HIDDEN_LAYERS> {
+        let Hidden(data) = self;
+        data
+    }
+    fn data_mut(&mut self) -> &mut mat_mul::Vector<f64, HIDDEN_LAYERS> {
+        let Hidden(data) = self;
+        data
+    }
+}
+
+impl DataWrapper<mat_mul::Vector<f64, MNIST_CLASSES>> for MNISTClassSmoother {
+    fn from_data(data: &mat_mul::Vector<f64, MNIST_CLASSES>) -> Self {
+        MNISTClassSmoother(data.clone())
+    }
+    fn data(&self) -> &mat_mul::Vector<f64, MNIST_CLASSES> {
+        let MNISTClassSmoother(data) = self;
+        data
+    }
+    fn data_mut(&mut self) -> &mut mat_mul::Vector<f64, MNIST_CLASSES> {
+        let MNISTClassSmoother(data) = self;
+        data
+    }
+}
 
 impl MNISTClass {
     fn smooth(&self) -> MNISTClassSmoother {
@@ -166,24 +198,14 @@ fn main() {
         crossbeam::channel::unbounded::<MNISTClassSmoother>();
     let (ground_truth_sender, leaf_ground_truth_rcv) =
         crossbeam::channel::unbounded::<MNISTClass>();
-    let (progress_sender, progress_receiver) = crossbeam::channel::unbounded::<f64>();
+    let (progress_sender, progress_receiver) =
+        crossbeam::channel::unbounded::<(f64, MNISTClassSmoother, MNISTClass)>();
 
     let mnist_input = RootNode {
         forward_input: root_inp_rcv,
         forward_output: OutputWithErrorBackProp {
             forward_data: root_out_send,
             reverse_error_prop: root_err_rcv,
-        },
-    };
-
-    let mnist_hidden = BranchNode {
-        input_channels: InputWithErrorBackProp {
-            forward_data: hidden_input_rcv,
-            reverse_error_prop: hidden_err_sender,
-        },
-        output_channels: OutputWithErrorBackProp {
-            forward_data: hidden_output_sender,
-            reverse_error_prop: hidde_err_rcv,
         },
     };
 
@@ -240,16 +262,12 @@ fn main() {
         let read_backward_data_for_fore = Arc::clone(&backward_owned_data);
 
         let input_mutex = Arc::new(Mutex::new(mat_mul::Vector::<f64, VEC_DIM>::new()));
-        let back_prop_input = Arc::clone(&input_mutex);
 
         let predictions_mutex = Arc::new(Mutex::new(mat_mul::Vector::<f64, VEC_DIM>::new()));
-        let back_prop_predictions = Arc::clone(&predictions_mutex);
 
         let predictions_errors_mutex = Arc::new(Mutex::new(mat_mul::Vector::<f64, VEC_DIM>::new()));
-        let back_prop_pred_err = Arc::clone(&predictions_errors_mutex);
 
         let activations_mutex = Arc::new(Mutex::new(mat_mul::Vector::<f64, HIDDEN_LAYERS>::new()));
-        let back_prop_activations = Arc::clone(&activations_mutex);
 
         // backprop thread
         thread::spawn(move || {
@@ -277,11 +295,15 @@ fn main() {
                     .zip(weights.row_iter_mut())
                     .for_each(
                         |((((node_delta, prediction_error), prediction), backprop_row), row)| {
-                            if node_delta.abs() > 0.1 * prediction_error.abs() {
+                            if node_delta.abs()
+                                > PREDICTION_LEARNING_THRESHOLD * prediction_error.abs()
+                            {
                                 *prediction -= ERR_LEARNING_RATE * node_delta
                             } else {
-                                let scale =
-                                    -1.0 * *backprop_row * WEIGHT_LEARNING_RATE * *prediction_error;
+                                let scale = -1.0
+                                    * backprop_row.min(GRADIENT_CUTOFF).max(-GRADIENT_CUTOFF)
+                                    * WEIGHT_LEARNING_RATE
+                                    * *prediction_error;
                                 let boost = &*input * scale;
                                 // println!("UPDATING WEIGHTS!");
                                 // println!("{:?}, {:?}", row, boost);
@@ -316,147 +338,278 @@ fn main() {
         });
     });
 
-    let hidden_layer_thr = thread::spawn(move || {
-        let mut rng = thread_rng();
+    struct HiddenLayerCalculator {
+        weights: mat_mul::Matrix<f64, MNIST_CLASSES, HIDDEN_LAYERS>,
+    }
 
-        println!("initialised next weights");
-        let hidden_layer_data =
-            mat_mul::Matrix::<f64, MNIST_CLASSES, HIDDEN_LAYERS>::from_distribution(
-                &mut rng,
+    impl HiddenLayerCalculator {
+        fn new<Rng: rand::Rng>(rng: &mut Rng) -> HiddenLayerCalculator {
+            let weights = mat_mul::Matrix::<f64, MNIST_CLASSES, HIDDEN_LAYERS>::from_distribution(
+                rng,
                 &Uniform::new(0., 1.0 / ((HIDDEN_LAYERS * MNIST_CLASSES) as f64).sqrt()),
             );
 
-        let hidden_layer_preds: mat_mul::Vector<f64, HIDDEN_LAYERS> =
-            mat_mul::Vector::from_distribution(
-                &mut rng,
-                &Uniform::new(0., 1.0 / (HIDDEN_LAYERS as f64)),
-            );
-
-        // This should be doable with left_right.  Probably need to implemnt two ops
-        // ```
-        // AddAssignWeights(mat_mul::Matrxic<f64, HIDDEN_LAYERS, MNIST_CLASSES>),
-        // AddAssignPredictions(mat_mul::Vector<f64, HIDDEN_LAYERS>)
-        // ```
-        struct HiddenLayerBackOwned {
-            weights: mat_mul::Matrix<f64, MNIST_CLASSES, HIDDEN_LAYERS>,
-            predictions: mat_mul::Vector<f64, HIDDEN_LAYERS>,
+            HiddenLayerCalculator { weights }
         }
+    }
 
-        struct HiddenLayerForwardOwned {
-            input: mat_mul::Vector<f64, HIDDEN_LAYERS>,
-            activation: mat_mul::Vector<f64, MNIST_CLASSES>,
-            prediction_errors: mat_mul::Vector<f64, HIDDEN_LAYERS>,
-        }
-
-        let back_prop_data = Arc::new(Mutex::new(HiddenLayerBackOwned {
-            weights: hidden_layer_data,
-            predictions: hidden_layer_preds,
-        }));
-
-        let read_back_prop_for_forward = Arc::clone(&back_prop_data);
-
-        let forward_data = Arc::new(Mutex::new(HiddenLayerForwardOwned {
-            input: mat_mul::Vector::new(),
-            activation: mat_mul::Vector::new(),
-            prediction_errors: mat_mul::Vector::new(),
-        }));
-
-        let read_forward_data_for_back_prop = Arc::clone(&forward_data);
-
-        let BranchNode {
-            input_channels,
-            output_channels,
-        } = mnist_hidden;
-
-        let OutputWithErrorBackProp {
-            forward_data: output_forward,
-            reverse_error_prop: output_backward,
-        } = output_channels;
-
-        let InputWithErrorBackProp {
-            forward_data: input_forward,
-            reverse_error_prop: input_backward,
-        } = input_channels;
-
-        // Error propagation thread
-        thread::spawn(move || {
-            output_backward.iter().for_each(|error_from_next| {
-                let MNISTClassSmoother(data) = error_from_next;
-
-                let HiddenLayerForwardOwned {
-                    input,
-                    activation,
-                    prediction_errors,
-                } = &*read_forward_data_for_back_prop.lock().unwrap();
-
-                let HiddenLayerBackOwned {
-                    weights,
-                    predictions,
-                } = &mut *back_prop_data.lock().unwrap();
-
-                let backprop = weights.transpose()
-                    * (activation.component_mul(&data)
-                        + (&*activation * ((&*activation * &data) * -1.0)));
-                // todo impl sub ops
-                let delta = &*prediction_errors + (&backprop * (-1.0));
-                delta
-                    .iter()
-                    .zip(prediction_errors.iter())
-                    .zip(predictions.iter_mut())
-                    .zip(backprop.iter())
-                    .zip(weights.row_iter_mut())
-                    .for_each(
-                        |((((node_delta, prediction_error), prediction), backprop_row), row)| {
-                            if node_delta.abs() > 0.1 * prediction_error.abs() {
-                                *prediction -= ERR_LEARNING_RATE * node_delta
-                            } else {
-                                let scale =
-                                    -1.0 * *backprop_row * WEIGHT_LEARNING_RATE * *prediction_error;
-                                let boost = &*input * scale;
-                                // println!("UPDATING WEIGHTS!");
-                                // println!("{:?}, {:?}", row, boost);
-                                *row += &boost;
-                            }
-                        },
-                    );
-                // This is so bad
-            });
-        });
-
-        // forward propagation
-        input_forward.iter().for_each(|hidden_input| {
-            let HiddenLayerForwardOwned {
-                input,
-                activation,
-                prediction_errors,
-            } = &mut *forward_data.lock().unwrap();
-
-            let HiddenLayerBackOwned {
-                weights,
-                predictions,
-            } = &*read_back_prop_for_forward.lock().unwrap();
-            let Hidden(data) = hidden_input;
-            *input += &data; // we exponentially average the stored input over time, to smooth out the weight updates
-            *input *= 0.5;
-            let new_prediction_errors = predictions + (&data * (-1.0));
-            *prediction_errors = new_prediction_errors.clone();
-            input_backward.send(Hidden(new_prediction_errors)).unwrap();
-
-            // todo: implement vec * matrix to get transpose mult
-            let logits = weights * &data;
+    impl DiffComp for HiddenLayerCalculator {
+        type InputType = mat_mul::Vector<f64, HIDDEN_LAYERS>;
+        type OutputType = mat_mul::Vector<f64, MNIST_CLASSES>;
+        fn forward(&self, input: &Self::InputType) -> Self::OutputType {
+            let logits = &self.weights * input;
             let mut total = 0.0;
             let exps = logits.map(|logit| {
                 let exp = logit.exp();
                 total += exp;
                 exp
             });
-            let output_data = exps.map(|x| x / total);
-            *activation = output_data.clone();
-            output_forward
-                .send(MNISTClassSmoother(output_data))
-                .expect("Should do something");
-        });
+            exps.map(|x| x / total)
+        }
+
+        fn backward(
+            &self,
+            pred_err_from_next: &Self::OutputType,
+            activation: &Self::OutputType,
+        ) -> Self::InputType {
+            self.weights.transpose()
+                * (activation.component_mul(pred_err_from_next)
+                    + (&*activation * ((&*activation * pred_err_from_next) * -1.0)))
+        }
+
+        fn update(
+            &mut self,
+            input: &Self::InputType,
+            error_from_next: &Self::OutputType,
+            activation: &Self::OutputType,
+            prediction_error: &Self::InputType,
+            prediction: &mut Self::InputType,
+        ) {
+            let backprop = self.backward(error_from_next, activation);
+            let delta = &*prediction_error + (&backprop * (-1.0));
+            delta
+                .iter()
+                .zip(prediction_error.iter())
+                .zip(prediction.iter_mut())
+                .zip(backprop.iter())
+                .zip(self.weights.row_iter_mut())
+                .for_each(
+                    |((((node_delta, prediction_error), prediction), backprop_row), row)| {
+                        if node_delta.abs() > PREDICTION_LEARNING_THRESHOLD * prediction_error.abs()
+                        {
+                            *prediction -= ERR_LEARNING_RATE * node_delta
+                        } else {
+                            let scale = -1.0
+                                * backprop_row.min(GRADIENT_CUTOFF).max(-GRADIENT_CUTOFF)
+                                * WEIGHT_LEARNING_RATE
+                                * *prediction_error;
+                            let boost = &*input * scale;
+                            // println!("UPDATING WEIGHTS!");
+                            // println!("{:?}, {:?}", row, boost);
+                            *row += &boost;
+                        }
+                    },
+                );
+        }
+    }
+
+    impl ExpAvgPreCod<f64> for HiddenLayerCalculator {
+        type InputType = mat_mul::Vector<f64, HIDDEN_LAYERS>;
+        type OutputType = mat_mul::Vector<f64, MNIST_CLASSES>;
+        const INPUT_RETENTION: f64 = 0.9;
+        const ACTIVATION_RETENTION: f64 = 0.9;
+    }
+
+    struct MNISTHiddenLayer(
+        BranchNode<
+            f64,
+            Hidden,
+            MNISTClassSmoother,
+            mat_mul::Vector<f64, HIDDEN_LAYERS>,
+            mat_mul::Vector<f64, MNIST_CLASSES>,
+            HiddenLayerCalculator,
+        >,
+    );
+
+    impl MNISTHiddenLayer {
+        fn new<Rng: rand::Rng>(
+            input_forward: crossbeam::channel::Receiver<Hidden>,
+            input_error: crossbeam::channel::Sender<Hidden>,
+            output_forward: crossbeam::channel::Sender<MNISTClassSmoother>,
+            output_error: crossbeam::channel::Receiver<MNISTClassSmoother>,
+            rng: &mut Rng,
+        ) -> MNISTHiddenLayer {
+            let calculator = HiddenLayerCalculator::new(rng);
+            let input_init = Hidden(mat_mul::Vector::<f64, HIDDEN_LAYERS>::new());
+            let activation_init = MNISTClassSmoother(mat_mul::Vector::<f64, MNIST_CLASSES>::new());
+            let branch_node = BranchNode::new(
+                input_forward,
+                input_error,
+                output_forward,
+                output_error,
+                input_init,
+                activation_init,
+                calculator,
+            );
+
+            MNISTHiddenLayer(branch_node)
+        }
+    }
+
+    let hidden_layer_thr = thread::spawn(move || {
+        let mut rng = thread_rng();
+        let MNISTHiddenLayer(hidden_layer_branch_node) = MNISTHiddenLayer::new(
+            hidden_input_rcv,
+            hidden_err_sender,
+            hidden_output_sender,
+            hidde_err_rcv,
+            &mut rng,
+        );
+        hidden_layer_branch_node.run();
     });
+    //
+    //        println!("initialised next weights");
+    //        let hidden_layer_data =
+    //            mat_mul::Matrix::<f64, MNIST_CLASSES, HIDDEN_LAYERS>::from_distribution(
+    //                &mut rng,
+    //                &Uniform::new(0., 1.0 / ((HIDDEN_LAYERS * MNIST_CLASSES) as f64).sqrt()),
+    //            );
+    //
+    //        let hidden_layer_preds: mat_mul::Vector<f64, HIDDEN_LAYERS> =
+    //            mat_mul::Vector::from_distribution(
+    //                &mut rng,
+    //                &Uniform::new(0., 1.0 / (HIDDEN_LAYERS as f64)),
+    //            );
+    //
+    //        // This should be doable with left_right.  Probably need to implemnt two ops
+    //        // ```
+    //        // AddAssignWeights(mat_mul::Matrxic<f64, HIDDEN_LAYERS, MNIST_CLASSES>),
+    //        // AddAssignPredictions(mat_mul::Vector<f64, HIDDEN_LAYERS>)
+    //        // ```
+    //        struct HiddenLayerBackOwned {
+    //            weights: mat_mul::Matrix<f64, MNIST_CLASSES, HIDDEN_LAYERS>,
+    //            predictions: mat_mul::Vector<f64, HIDDEN_LAYERS>,
+    //        }
+    //
+    //        struct HiddenLayerForwardOwned {
+    //            input: mat_mul::Vector<f64, HIDDEN_LAYERS>,
+    //            activation: mat_mul::Vector<f64, MNIST_CLASSES>,
+    //            prediction_errors: mat_mul::Vector<f64, HIDDEN_LAYERS>,
+    //        }
+    //
+    //        let back_prop_data = Arc::new(Mutex::new(HiddenLayerBackOwned {
+    //            weights: hidden_layer_data,
+    //            predictions: hidden_layer_preds,
+    //        }));
+    //
+    //        let read_back_prop_for_forward = Arc::clone(&back_prop_data);
+    //
+    //        let forward_data = Arc::new(Mutex::new(HiddenLayerForwardOwned {
+    //            input: mat_mul::Vector::new(),
+    //            activation: mat_mul::Vector::new(),
+    //            prediction_errors: mat_mul::Vector::new(),
+    //        }));
+    //
+    //        let read_forward_data_for_back_prop = Arc::clone(&forward_data);
+    //
+    //        let BranchNode {
+    //            input_channels,
+    //            output_channels,
+    //        } = mnist_hidden;
+    //
+    //        let OutputWithErrorBackProp {
+    //            forward_data: output_forward,
+    //            reverse_error_prop: output_backward,
+    //        } = output_channels;
+    //
+    //        let InputWithErrorBackProp {
+    //            forward_data: input_forward,
+    //            reverse_error_prop: input_backward,
+    //        } = input_channels;
+    //
+    //        // Error propagation thread
+    //        thread::spawn(move || {
+    //            output_backward.iter().for_each(|error_from_next| {
+    //                let MNISTClassSmoother(data) = error_from_next;
+    //
+    //                let HiddenLayerForwardOwned {
+    //                    input,
+    //                    activation,
+    //                    prediction_errors,
+    //                } = &*read_forward_data_for_back_prop.lock().unwrap();
+    //
+    //                let HiddenLayerBackOwned {
+    //                    weights,
+    //                    predictions,
+    //                } = &mut *back_prop_data.lock().unwrap();
+    //
+    //                let backprop = weights.transpose()
+    //                    * (activation.component_mul(&data)
+    //                        + (&*activation * ((&*activation * &data) * -1.0)));
+    //                // todo impl sub ops
+    //                let delta = &*prediction_errors + (&backprop * (-1.0));
+    //                delta
+    //                    .iter()
+    //                    .zip(prediction_errors.iter())
+    //                    .zip(predictions.iter_mut())
+    //                    .zip(backprop.iter())
+    //                    .zip(weights.row_iter_mut())
+    //                    .for_each(
+    //                        |((((node_delta, prediction_error), prediction), backprop_row), row)| {
+    //                            if node_delta.abs()
+    //                                > PREDICTION_LEARNING_THRESHOLD * prediction_error.abs()
+    //                            {
+    //                                *prediction -= ERR_LEARNING_RATE * node_delta
+    //                            } else {
+    //                                let scale = -1.0
+    //                                    * backprop_row.min(GRADIENT_CUTOFF).max(-GRADIENT_CUTOFF)
+    //                                    * WEIGHT_LEARNING_RATE
+    //                                    * *prediction_error;
+    //                                let boost = &*input * scale;
+    //                                // println!("UPDATING WEIGHTS!");
+    //                                // println!("{:?}, {:?}", row, boost);
+    //                                *row += &boost;
+    //                            }
+    //                        },
+    //                    );
+    //                // This is so bad
+    //            });
+    //        });
+    //
+    //        // forward propagation
+    //        input_forward.iter().for_each(|hidden_input| {
+    //            let HiddenLayerForwardOwned {
+    //                input,
+    //                activation,
+    //                prediction_errors,
+    //            } = &mut *forward_data.lock().unwrap();
+    //
+    //            let HiddenLayerBackOwned {
+    //                weights,
+    //                predictions,
+    //            } = &*read_back_prop_for_forward.lock().unwrap();
+    //            let Hidden(data) = hidden_input;
+    //            *input += &data; // we exponentially average the stored input over time, to smooth out the weight updates
+    //            *input *= 0.5;
+    //            let new_prediction_errors = predictions + (&data * (-1.0));
+    //            *prediction_errors = new_prediction_errors.clone();
+    //            input_backward.send(Hidden(new_prediction_errors)).unwrap();
+    //
+    //            // todo: implement vec * matrix to get transpose mult
+    //            let logits = weights * &data;
+    //            let mut total = 0.0;
+    //            let exps = logits.map(|logit| {
+    //                let exp = logit.exp();
+    //                total += exp;
+    //                exp
+    //            });
+    //            let output_data = exps.map(|x| x / total);
+    //            *activation = output_data.clone();
+    //            output_forward
+    //                .send(MNISTClassSmoother(output_data))
+    //                .expect("Should do something");
+    //        });
+    //    });
 
     let mnist_output_thr =
         thread::spawn(move || {
@@ -481,49 +634,64 @@ fn main() {
                 let MNISTClassSmoother(data) = class_input;
                 let guard = current_label.lock().expect("Couldn't get current_label");
                 let MNISTClass(current_label_data) = &*guard;
-                let (index, pred) = data
+                let backprop_iter = data
                     .iter()
                     .zip(current_label_data.iter())
-                    .enumerate()
-                    .find_map(|(index, (pred, bool_index))| {
-                        if *bool_index {
-                            Some((index, pred))
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap();
-                let loss = -pred.ln();
-                //println!("LOSS: {:?}", loss);
+                    .map(|(x, label)| if *label { -1.0 / *x } else { 1.0 / *x });
+                // println!("LOSS: {:?}", loss);
                 // println!("Index label: {:?}", index);
                 // println!("prediction: {:?}", data);
                 // println!("Updating progress");
                 let mut back_prop_data = [0.0; MNIST_CLASSES];
-                back_prop_data[index] = -1.0 / pred;
+                let loss = data
+                    .iter()
+                    .zip(current_label_data.iter())
+                    .map(|(pred, label)| if *label { -pred.ln() } else { pred.ln() })
+                    .sum();
                 input_channels.reverse_error_prop.send(MNISTClassSmoother(
-                    mat_mul::Vector::from_iter(back_prop_data.iter().map(|x| *x)),
+                    mat_mul::Vector::from_iter(backprop_iter),
                 ));
-                progress_sender.send(loss).expect("Can't update progress");
+                progress_sender
+                    .send((
+                        loss,
+                        MNISTClassSmoother(data),
+                        MNISTClass(current_label_data.clone()),
+                    ))
+                    .expect("Can't update progress");
             });
         });
 
-    let threes = indexes_by_class.get(3).unwrap();
     let mut counter = 0;
-    for _ in 0..40000 {
-        let threes_index = (&mut rng).gen_range(0..threes.len());
-        let index = *(&threes).get(threes_index).unwrap();
-        mnist_input_send.send(images[index].to_f32_arr()).unwrap();
-        ground_truth_sender.send(labels[index].clone()).unwrap();
-        counter += 1;
-        //println!("{}", &images[index]);
-        //println!("LABEL: {:?}", (&labels)[index].get_index());
+    let first_batch_size = 10000;
+    let epochs = 100;
+    for epoch in (1..(epochs + 1)).rev() {
+        let i = (&mut rng).gen_range(0..10);
+        let indexes = indexes_by_class.get(i).unwrap();
+        for _ in 0..(first_batch_size / ((epoch as f64).sqrt() as i32)) {
+            let sample = (&mut rng).gen_range(0..indexes.len());
+            let index = *(&indexes).get(sample).unwrap();
+            mnist_input_send.send(images[index].to_f32_arr()).unwrap();
+            ground_truth_sender.send(labels[index].clone()).unwrap();
+            counter += 1;
+            if counter % 1000 == 0 {
+                println!("label: {:?}", labels[index].clone());
+            }
+            //println!("{}", &images[index]);
+            //println!("LABEL: {:?}", (&labels)[index].get_index());
+        }
     }
 
     let mut processed = 0;
-    progress_receiver.iter().take(counter).for_each(|loss| {
-        processed += 1;
-        if processed % 100 == 0 {
-            println!("processed {:?}. Loss: {:?}", processed, loss);
-        }
-    });
+    progress_receiver
+        .iter()
+        .take(counter)
+        .for_each(|(loss, pred, label)| {
+            processed += 1;
+            if processed % 1000 == 0 {
+                println!("processed {:?}. Loss: {:?}", processed, loss);
+                println!("Prediction: {:?}", pred);
+                println!("sum: {:?}", pred.0.iter().map(|x| *x).sum::<f64>());
+                println!("label: {:?}", label);
+            }
+        });
 }
