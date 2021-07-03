@@ -545,14 +545,61 @@ where
     }
 }
 
+impl<F, const N: usize, const M: usize> Mul<&Matrix<F, N, M>> for &Vector<F, N>
+where
+    F: Add<F, Output = F> + Mul<F, Output = F> + AddAssign<F> + Copy + Zero,
+{
+    type Output = Vector<F, M>;
+    fn mul(self, rhs: &Matrix<F, N, M>) -> Vector<F, M> {
+        let mut accum = Vector::<F, M>::new();
+        self.iter()
+            .zip(rhs.row_iter())
+            .for_each(|(vec_entry, matrix_row)| {
+                accum += matrix_row * *vec_entry;
+            });
+
+        accum
+    }
+}
+
+impl<F, const N: usize, const M: usize> Mul<Matrix<F, N, M>> for &Vector<F, N>
+where
+    F: Add<F, Output = F> + Mul<F, Output = F> + AddAssign<F> + Copy + Zero,
+{
+    type Output = Vector<F, M>;
+    fn mul(self, rhs: Matrix<F, N, M>) -> Vector<F, M> {
+        self * &rhs
+    }
+}
+
+impl<F, const N: usize, const M: usize> Mul<&Matrix<F, N, M>> for Vector<F, N>
+where
+    F: Add<F, Output = F> + Mul<F, Output = F> + AddAssign<F> + Copy + Zero,
+{
+    type Output = Vector<F, M>;
+    fn mul(self, rhs: &Matrix<F, N, M>) -> Vector<F, M> {
+        &self * rhs
+    }
+}
+
+impl<F, const N: usize, const M: usize> Mul<Matrix<F, N, M>> for Vector<F, N>
+where
+    F: Add<F, Output = F> + Mul<F, Output = F> + AddAssign<F> + Copy + Zero,
+{
+    type Output = Vector<F, M>;
+    fn mul(self, rhs: Matrix<F, N, M>) -> Vector<F, M> {
+        &self * &rhs
+    }
+}
+
 #[cfg(test)]
 mod test {
     const TOL: f64 = 1.0e-7;
 
-    use crate::mat_mul::Vector;
+    use crate::mat_mul::{Matrix, Vector};
     use num_traits::Zero;
     use rand::thread_rng;
-    use rand_distr;
+    use rand_distr::{self, Distribution};
 
     #[test]
     fn test_transpose() {}
@@ -596,11 +643,46 @@ mod test {
     #[test]
     fn test_add_and_scalar_mult() {
         const DIM: usize = 200;
-        let rng = thread_rng();
         let ones = Vector::<i32, DIM>::ones();
         let mut neg = ones.clone();
         neg *= -1;
         let zeros = Vector::<i32, DIM>::new();
         assert_eq!(&ones + &neg, zeros);
+    }
+
+    #[test]
+    fn test_transpose_mul() {
+        const ROWS: usize = 2;
+        const COLS: usize = 3;
+        let row_1 = [1, 2, 3];
+        let row_2 = [0, 4, 5];
+
+        let data = [row_1, row_2];
+        let matrix = Matrix::<i32, ROWS, COLS>::from_iter(
+            data.iter().flat_map(|row| row.iter()).map(|x| *x),
+        );
+        let row_1 = Vector::<i32, COLS>::from_iter(row_1.iter().map(|x| *x));
+        let row_2 = Vector::<i32, COLS>::from_iter(row_2.iter().map(|x| *x));
+
+        let upper_vector = Vector::<i32, ROWS>::from_iter([1, 0].iter().map(|x| *x));
+        let lower_vector = Vector::<i32, ROWS>::from_iter([0, 1].iter().map(|x| *x));
+        assert_eq!(&upper_vector * &matrix, row_1);
+        assert_eq!(&lower_vector * &matrix, row_2);
+        assert_eq!(
+            ((&lower_vector * 3) + (&upper_vector * 2)) * matrix,
+            (&row_2 * 3) + (&row_1 * 2)
+        );
+
+        const BIG_ROWS: usize = 100;
+        const BIG_COLS: usize = 200;
+
+        let mut rng = thread_rng();
+        let poisson_pi = rand_distr::Poisson::new(3.1415926)
+            .unwrap()
+            .map(|x| x as i32);
+        let left = Vector::<i32, BIG_ROWS>::from_distribution(&mut rng, &poisson_pi);
+        let right = Vector::<i32, BIG_COLS>::from_distribution(&mut rng, &poisson_pi);
+        let matrix = Matrix::<i32, BIG_ROWS, BIG_COLS>::from_distribution(&mut rng, &poisson_pi);
+        assert_eq!((&left * &matrix) * &right, &left * (&matrix * &right));
     }
 }

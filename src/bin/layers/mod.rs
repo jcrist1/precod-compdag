@@ -7,6 +7,7 @@ use precod_compdag::LeafNode;
 use precod_compdag::OutputWithErrorBackProp;
 use precod_compdag::PreCodDagComms;
 use precod_compdag::PreCodDagNode;
+use precod_compdag::PredictiveCoding;
 use rand;
 use rand::prelude::*;
 use rand_distr::Uniform;
@@ -20,30 +21,32 @@ use std::sync::Mutex;
 use std::thread;
 use thiserror::Error;
 
-const VEC_DIM: usize = 784; // IMAGE_DIM * IMAGE_DIM
+pub const VEC_DIM: usize = 784; // IMAGE_DIM * IMAGE_DIM
 pub const MNIST_CLASSES: usize = 10;
 const HIDDEN_LAYERS: usize = 128;
-const ERR_LEARNING_RATE: f64 = 0.2;
-const WEIGHT_LEARNING_RATE: f64 = 0.2;
+const ERR_LEARNING_RATE: f64 = 0.5;
+const WEIGHT_LEARNING_RATE: f64 = 0.01;
 const PREDICTION_LEARNING_THRESHOLD: f64 = 0.2;
-const IMAGE_DIM: usize = 28;
+pub const IMAGE_DIM: usize = 28;
 const MAX_U8_AS_F64: f64 = 256.0;
-const EMPTY_VEC: Vec<usize> = Vec::<usize>::new();
+pub const EMPTY_VEC: Vec<usize> = Vec::<usize>::new();
 const GRADIENT_CUTOFF: f64 = 1.0;
 const TOL: f64 = 1.0e-7;
 
+//todo remove pub value
 #[derive(Debug, Clone)]
-pub struct MNISTImage(mat_mul::Matrix<u8, IMAGE_DIM, IMAGE_DIM>);
+pub struct MNISTImage(pub mat_mul::Matrix<u8, IMAGE_DIM, IMAGE_DIM>);
 
+//todo remove pub value
 #[derive(Debug, Clone)]
-pub struct MNISTClass(mat_mul::Vector<bool, MNIST_CLASSES>);
+pub struct MNISTClass(pub mat_mul::Vector<bool, MNIST_CLASSES>);
 impl MNISTClass {
-    fn smooth(&self) -> MNISTClassSmoother {
+    pub fn smooth(&self) -> MNISTClassSmoother {
         let MNISTClass(data) = self;
         MNISTClassSmoother(data.map(|x| (*x as i32) as f64))
     }
 
-    fn get_index(&self) -> usize {
+    pub fn get_index(&self) -> usize {
         let MNISTClass(data) = self;
         data.iter()
             .enumerate()
@@ -92,7 +95,7 @@ impl Default for MNISTClass {
 }
 
 impl MNISTImage {
-    fn to_f32_arr(&self) -> MNISTVector {
+    pub fn to_f32_arr(&self) -> MNISTVector {
         let MNISTImage(data) = self;
         MNISTVector(mat_mul::Vector::from_iter(
             data.iter().map(|datum| *datum as f64),
@@ -101,7 +104,7 @@ impl MNISTImage {
 }
 
 #[derive(Debug, Clone)]
-struct MNISTVector(mat_mul::Vector<f64, VEC_DIM>);
+pub struct MNISTVector(pub mat_mul::Vector<f64, VEC_DIM>);
 
 // todo: make this derivable as a macro?
 impl DataWrapper<mat_mul::Vector<f64, VEC_DIM>> for MNISTVector {
@@ -119,7 +122,7 @@ impl DataWrapper<mat_mul::Vector<f64, VEC_DIM>> for MNISTVector {
 }
 
 #[derive(Debug)]
-struct Hidden(mat_mul::Vector<f64, HIDDEN_LAYERS>);
+pub struct Hidden(mat_mul::Vector<f64, HIDDEN_LAYERS>);
 
 impl DataWrapper<mat_mul::Vector<f64, HIDDEN_LAYERS>> for Hidden {
     fn from_data(data: &mat_mul::Vector<f64, HIDDEN_LAYERS>) -> Self {
@@ -136,7 +139,7 @@ impl DataWrapper<mat_mul::Vector<f64, HIDDEN_LAYERS>> for Hidden {
 }
 
 #[derive(Debug)]
-struct MNISTClassSmoother(mat_mul::Vector<f64, MNIST_CLASSES>);
+pub struct MNISTClassSmoother(pub mat_mul::Vector<f64, MNIST_CLASSES>);
 
 impl DataWrapper<mat_mul::Vector<f64, MNIST_CLASSES>> for MNISTClassSmoother {
     fn from_data(data: &mat_mul::Vector<f64, MNIST_CLASSES>) -> Self {
@@ -152,7 +155,132 @@ impl DataWrapper<mat_mul::Vector<f64, MNIST_CLASSES>> for MNISTClassSmoother {
     }
 }
 
-struct HiddenLayerCalculator {
+pub struct InputLayerCalculator {
+    weights: mat_mul::Matrix<f64, HIDDEN_LAYERS, VEC_DIM>,
+}
+impl InputLayerCalculator {
+    fn new<Rng: rand::Rng>(rng: &mut Rng) -> InputLayerCalculator {
+        let weights = mat_mul::Matrix::<f64, HIDDEN_LAYERS, VEC_DIM>::from_distribution(
+            rng,
+            &Uniform::new(0., 1.0 / ((VEC_DIM * HIDDEN_LAYERS) as f64).sqrt()),
+        );
+
+        InputLayerCalculator { weights }
+    }
+}
+impl ExpAvgPreCod<f64> for InputLayerCalculator {
+    type InputType = mat_mul::Vector<f64, VEC_DIM>;
+    type OutputType = mat_mul::Vector<f64, HIDDEN_LAYERS>;
+    const INPUT_RETENTION: f64 = 0.9;
+    const ACTIVATION_RETENTION: f64 = 0.9;
+}
+
+impl DiffComp for InputLayerCalculator {
+    type InputType = mat_mul::Vector<f64, VEC_DIM>;
+    type OutputType = mat_mul::Vector<f64, HIDDEN_LAYERS>;
+    fn forward(
+        &self,
+        input: &Self::InputType,
+        activation: &mut Self::OutputType,
+    ) -> Self::OutputType {
+        let mut logits = &self.weights * input;
+        self.smooth_activation(activation, &logits);
+        logits.map_inplace(|x| x.tanh());
+        logits
+    }
+
+    fn backward(
+        &self,
+        pred_err_from_next: &Self::OutputType,
+        activation: &Self::OutputType,
+    ) -> Self::OutputType {
+        activation.map(|x| x.cosh().powi(-2))
+    }
+
+    fn update(
+        &mut self,
+        input: &Self::InputType,
+        error_from_next: &Self::OutputType,
+        activation: &Self::OutputType,
+        prediction_error: &Self::InputType,
+        prediction: &mut Self::InputType,
+    ) {
+        let mut backprop = self.backward(error_from_next, activation);
+        backprop.map_inplace(|x| x.min(GRADIENT_CUTOFF).max(-GRADIENT_CUTOFF));
+
+        let node_adjust = &backprop * &self.weights;
+        let mut delta = prediction_error.clone();
+        delta -= &node_adjust;
+        let mut weight_update_row = input.clone();
+        weight_update_row
+            .iter_mut()
+            .zip(delta.iter_mut())
+            .zip(prediction_error.iter())
+            .for_each(|((input_entry, delta_entry), prediction_error_entry)| {
+                // We only update the weights if the update_to_the_prediction is convergent
+                // It may be worth rethinking this, and have the backprop only get sent
+                // when the prediction is converged.
+                if delta_entry.abs() > PREDICTION_LEARNING_THRESHOLD * prediction_error_entry.abs()
+                {
+                    *input_entry = 0.0;
+                    *delta_entry *= -ERR_LEARNING_RATE;
+                } else {
+                    *delta_entry = 0.0;
+                    *input_entry *= WEIGHT_LEARNING_RATE;
+                }
+            });
+
+        *prediction += delta;
+        self.weights
+            .row_iter_mut()
+            .zip(error_from_next.iter())
+            .zip(backprop.iter())
+            .for_each(|((row, err_from_next_entry), backprop_entry)| {
+                *row += &weight_update_row * *err_from_next_entry * *backprop_entry;
+            });
+    }
+}
+
+pub struct MNISTInputLayer(
+    pub  PreCodDagNode<
+        f64,
+        MNISTVector,
+        mat_mul::Vector<f64, VEC_DIM>,
+        Hidden,
+        mat_mul::Vector<f64, HIDDEN_LAYERS>,
+        InputLayerCalculator,
+    >,
+);
+
+impl MNISTInputLayer {
+    pub fn new<Rng: rand::Rng>(
+        input_forward: crossbeam::channel::Receiver<MNISTVector>,
+        output_forward: crossbeam::channel::Sender<Hidden>,
+        output_error: crossbeam::channel::Receiver<Hidden>,
+        rng: &mut Rng,
+    ) -> MNISTInputLayer {
+        let calculator = InputLayerCalculator::new(rng);
+        let input_init = MNISTVector(mat_mul::Vector::<f64, VEC_DIM>::new());
+        let activation_init = Hidden(mat_mul::Vector::<f64, HIDDEN_LAYERS>::new());
+        let comms = PreCodDagComms::Root {
+            input_forward,
+            output_forward,
+            output_error,
+        };
+        let dag_node = PreCodDagNode::<
+            f64,
+            MNISTVector,
+            mat_mul::Vector<f64, VEC_DIM>,
+            Hidden,
+            mat_mul::Vector<f64, HIDDEN_LAYERS>,
+            InputLayerCalculator,
+        >::new(comms, input_init, activation_init, calculator);
+
+        MNISTInputLayer(dag_node)
+    }
+}
+
+pub struct HiddenLayerCalculator {
     weights: mat_mul::Matrix<f64, MNIST_CLASSES, HIDDEN_LAYERS>,
 }
 
@@ -166,12 +294,16 @@ impl HiddenLayerCalculator {
         HiddenLayerCalculator { weights }
     }
 }
-
 impl DiffComp for HiddenLayerCalculator {
     type InputType = mat_mul::Vector<f64, HIDDEN_LAYERS>;
     type OutputType = mat_mul::Vector<f64, MNIST_CLASSES>;
-    fn forward(&self, input: &Self::InputType) -> Self::OutputType {
+    fn forward(
+        &self,
+        input: &Self::InputType,
+        activation: &mut Self::OutputType,
+    ) -> Self::OutputType {
         let logits = &self.weights * input;
+        self.smooth_activation(activation, &logits);
         let mut total = 0.0;
         let exps = logits.map(|logit| {
             let exp = logit.exp();
@@ -185,10 +317,8 @@ impl DiffComp for HiddenLayerCalculator {
         &self,
         pred_err_from_next: &Self::OutputType,
         activation: &Self::OutputType,
-    ) -> Self::InputType {
-        self.weights.transpose()
-            * (activation.component_mul(pred_err_from_next)
-                + (&*activation * ((&*activation * pred_err_from_next) * -1.0)))
+    ) -> Self::OutputType {
+        activation + (&*activation * ((&*activation * pred_err_from_next) * -1.0))
     }
 
     fn update(
@@ -199,30 +329,38 @@ impl DiffComp for HiddenLayerCalculator {
         prediction_error: &Self::InputType,
         prediction: &mut Self::InputType,
     ) {
-        let backprop = self.backward(error_from_next, activation);
-        let delta = &*prediction_error + (&backprop * (-1.0));
-        delta
-            .iter()
+        let mut backprop = self.backward(error_from_next, activation);
+        backprop.map_inplace(|x| x.min(GRADIENT_CUTOFF).max(-GRADIENT_CUTOFF));
+
+        let node_adjust = &backprop * &self.weights;
+        let mut delta = prediction_error.clone();
+        delta -= &node_adjust;
+        let mut weight_update_row = input.clone();
+        weight_update_row
+            .iter_mut()
+            .zip(delta.iter_mut())
             .zip(prediction_error.iter())
-            .zip(prediction.iter_mut())
+            .for_each(|((input_entry, delta_entry), prediction_error_entry)| {
+                // We only update the weights if the update_to_the_prediction is convergent
+                // It may be worth rethinking this, and have the backprop only get sent
+                // when the prediction is converged.
+                if delta_entry.abs() > PREDICTION_LEARNING_THRESHOLD * prediction_error_entry.abs()
+                {
+                    *input_entry = 0.0;
+                    *delta_entry *= -ERR_LEARNING_RATE;
+                } else {
+                    *delta_entry = 0.0;
+                    *input_entry *= WEIGHT_LEARNING_RATE;
+                }
+            });
+        *prediction += delta;
+        self.weights
+            .row_iter_mut()
+            .zip(error_from_next.iter())
             .zip(backprop.iter())
-            .zip(self.weights.row_iter_mut())
-            .for_each(
-                |((((node_delta, prediction_error), prediction), backprop_row), row)| {
-                    if node_delta.abs() > PREDICTION_LEARNING_THRESHOLD * prediction_error.abs() {
-                        *prediction -= ERR_LEARNING_RATE * node_delta
-                    } else {
-                        let scale = -1.0
-                            * backprop_row.min(GRADIENT_CUTOFF).max(-GRADIENT_CUTOFF)
-                            * WEIGHT_LEARNING_RATE
-                            * *prediction_error;
-                        let boost = &*input * scale;
-                        // println!("UPDATING WEIGHTS!");
-                        // println!("{:?}, {:?}", row, boost);
-                        *row += &boost;
-                    }
-                },
-            );
+            .for_each(|((row, err_from_next_entry), backprop_entry)| {
+                *row += &weight_update_row * *err_from_next_entry * *backprop_entry;
+            });
     }
 }
 
@@ -233,8 +371,8 @@ impl ExpAvgPreCod<f64> for HiddenLayerCalculator {
     const ACTIVATION_RETENTION: f64 = 0.9;
 }
 
-struct MNISTHiddenLayer(
-    PreCodDagNode<
+pub struct MNISTHiddenLayer(
+    pub  PreCodDagNode<
         f64,
         Hidden,
         mat_mul::Vector<f64, HIDDEN_LAYERS>,
@@ -245,7 +383,7 @@ struct MNISTHiddenLayer(
 );
 
 impl MNISTHiddenLayer {
-    fn new<Rng: rand::Rng>(
+    pub fn new<Rng: rand::Rng>(
         input_forward: crossbeam::channel::Receiver<Hidden>,
         input_error: crossbeam::channel::Sender<Hidden>,
         output_forward: crossbeam::channel::Sender<MNISTClassSmoother>,

@@ -77,13 +77,17 @@ pub trait DiffComp {
     type InputType;
     type OutputType;
 
-    fn forward(&self, input: &Self::InputType) -> Self::OutputType;
+    fn forward(
+        &self,
+        input: &Self::InputType,
+        activation: &mut Self::OutputType,
+    ) -> Self::OutputType;
 
     fn backward(
         &self,
         gradient: &Self::OutputType,
         activation: &Self::OutputType,
-    ) -> Self::InputType;
+    ) -> Self::OutputType;
 
     fn update(
         &mut self,
@@ -229,8 +233,7 @@ where
                             )
                         })
                         .unwrap_or(Ok(()))?;
-                    let output = calculator.forward(input);
-                    calculator.smooth_activation(activation, &output);
+                    let output = calculator.forward(input, activation);
                     // If we are in a leaf node, we don't have to send any more data
                     // otherwise we have to pass the activation to the next level
                     self.forward_data_to_next
